@@ -98,7 +98,10 @@ permissions:
 jobs:
   build:
     name: Build ${{ inputs.config }}
-    runs-on: ubuntu-latest
+    # Pinned on purpose: `ubuntu-latest` is mid-migration to Ubuntu 26, and a
+    # 4.19 kernel must be built against a toolchain/system combination that does
+    # not change under us between runs.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     outputs:
       device: ${{ steps.meta.outputs.device }}
@@ -113,6 +116,7 @@ jobs:
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
       CCACHE_HARDLINK: "true"
+      DEBIAN_FRONTEND: "noninteractive"
 
       # workflow inputs -> IN_* overrides consumed by scripts/config.sh
       IN_KSU_VARIANT: ${{ inputs.ksu_variant }}
@@ -130,17 +134,30 @@ jobs:
       - name: Resolve configuration
         run: bash scripts/config.sh
 
+      # Do NOT use jlumbroso/free-disk-space here. Its `large-packages` option
+      # runs `apt-get remove -y <hardcoded list> --fix-missing`; on the newer
+      # runner images several of those packages no longer exist, the removal
+      # exits 100 and leaves dpkg half-configured, which then makes the very
+      # next apt-get call fail with the same exit code. Deleting directories is
+      # equally effective and cannot corrupt the package database.
       - name: Free up disk space
         if: env.REMOVE_UNUSED_PACKAGES == 'true'
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: true
-          android: false
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android/sdk \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/node_modules \
+            /opt/az \
+            /usr/share/swift || true
+          sudo apt-get clean || true
+          docker image prune -af || true
+          sudo rm -rf /var/lib/docker/aufs /var/lib/docker/overlay2/* || true
+          df -h /
 
       - name: Add swap space
         run: |
@@ -154,15 +171,124 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update -qq
-          # Kept deliberately lean. The historical list here was copied from the
-          # full AOSP platform build docs and pulled in ~40 packages a kernel
-          # build never touches, several of which no longer exist on current
-          # Ubuntu (python2, lib32ncurses5-dev, ...).
-          sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache cpio curl device-tree-compiler flex \
-            git libelf-dev libssl-dev lz4 make python3 rsync unzip zip zstd \
+          set -o pipefail
+
+          # Real cause of the earlier exit-100 failures: the runner image points
+          # apt at azure.archive.ubuntu.com, which does not resolve from this
+          # runner ("Temporary failure resolving"). apt then burns ~8 minutes
+          # timing out every repository and exits 100. So: rewrite the sources to
+          # a plain upstream mirror, try a few, and decide whether the build can
+          # continue by looking for the actual host tools -- not by trusting apt.
+          APT_LOG="${RUNNER_TEMP:-/tmp}/apt.log"
+          : > "$APT_LOG"
+
+          # shellcheck source=/dev/null
+          . /etc/os-release
+          SUITE="${UBUNTU_CODENAME:-${VERSION_CODENAME:-noble}}"
+          echo "ubuntu codename: $SUITE"
+
+          APT=(
+            -y --no-install-recommends
+            -o DPkg::Lock::Timeout=180
+            -o Acquire::ForceIPv4=true
+            -o Acquire::Retries=1
+            -o Acquire::http::Timeout=15
+            -o Acquire::https::Timeout=15
+            -o Dpkg::Options::=--force-confdef
+            -o Dpkg::Options::=--force-confold
+          )
+
+          PKGS=(
+            bc bison build-essential ccache cpio curl device-tree-compiler flex
+            git libelf-dev libssl-dev lz4 make python3 rsync unzip zip zstd
             libncurses-dev
+          )
+
+          set_mirror() {
+            local uri=$1
+            printf 'Types: deb\nURIs: %s\nSuites: %s %s-updates %s-backports %s-security\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+              "$uri" "$SUITE" "$SUITE" "$SUITE" "$SUITE" \
+              | sudo tee /etc/apt/sources.list.d/ubuntu.sources >/dev/null
+            printf '%s/\n' "$uri" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          }
+
+          sudo dpkg --configure -a 2>&1 | tee -a "$APT_LOG" >/dev/null || true
+
+          MIRRORS=(
+            "http://archive.ubuntu.com/ubuntu"
+            "https://mirrors.edge.kernel.org/ubuntu"
+            "http://mirrors.aliyun.com/ubuntu"
+            "http://azure.archive.ubuntu.com/ubuntu"
+          )
+
+          want=()
+          for m in "${MIRRORS[@]}"; do
+            want=()
+            for p in "${PKGS[@]}"; do
+              dpkg -s "$p" >/dev/null 2>&1 || want+=("$p")
+            done
+            if [ ${#want[@]} -eq 0 ]; then
+              echo "all build dependencies already present"
+              break
+            fi
+
+            host="${m#*://}"
+            host="${host%%/*}"
+            if ! getent hosts "$host" >/dev/null 2>&1; then
+              echo "::warning::DNS lookup failed for $host, skipping this mirror"
+              continue
+            fi
+
+            echo "=== mirror $m ; missing: ${want[*]} ==="
+            set_mirror "$m"
+
+            if timeout 180 sudo apt-get "${APT[@]}" update 2>&1 | tee -a "$APT_LOG" >/dev/null; then
+              echo "apt-get update ok via $m"
+              timeout 600 sudo apt-get "${APT[@]}" install "${want[@]}" 2>&1 | tee -a "$APT_LOG" >/dev/null || true
+            else
+              echo "::warning::apt-get update failed via $m"
+            fi
+          done
+
+          still=()
+          for p in "${PKGS[@]}"; do
+            dpkg -s "$p" >/dev/null 2>&1 || still+=("$p")
+          done
+          echo "apt packages still missing: ${still[*]:-none}"
+          if [ ${#still[@]} -gt 0 ]; then
+            # Surfaced as an annotation on purpose: the job log needs auth to
+            # download, annotations can be read from the public API.
+            echo "::warning::apt packages still missing, continuing with what the image has: ${still[*]}"
+          fi
+
+          # What actually matters for the kernel build.
+          NO_TOOLS=()
+          for t in make gcc bison flex bc cpio python3 perl tar gzip git; do
+            command -v "$t" >/dev/null 2>&1 || NO_TOOLS+=("$t")
+          done
+          echo "host tools still missing: ${NO_TOOLS[*]:-none}"
+
+          if [ ${#NO_TOOLS[@]} -gt 0 ]; then
+            echo "::error::host tools required by the kernel build are unavailable: ${NO_TOOLS[*]}"
+            tail -n 40 "$APT_LOG" | while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error::APT| ${line}"
+            done
+            exit 1
+          fi
+
+          # ccache is only a speed-up; drop the ccache step instead of failing.
+          if ! command -v ccache >/dev/null 2>&1; then
+            echo "::warning::ccache unavailable, disabling the ccache step"
+            echo "ENABLE_CCACHE=false" >> "$GITHUB_ENV"
+          fi
+
+          # libssl-dev is only pulled in by scripts/sign-file. Without it the
+          # kernel still builds and boots, it just cannot sign modules itself.
+          if ! dpkg -s libssl-dev >/dev/null 2>&1; then
+            echo "::warning::libssl-dev unavailable, building with CONFIG_MODULE_SIG=n"
+            echo "EXTRA_DEFCONFIG=${EXTRA_DEFCONFIG:-} CONFIG_MODULE_SIG=n" >> "$GITHUB_ENV"
+          fi
+
           mkdir -p "$WORKSPACE"
 
       - name: Set up toolchain
@@ -237,7 +363,7 @@ jobs:
     name: Publish release
     needs: build
     if: inputs.publish_release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
